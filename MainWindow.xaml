@@ -1,0 +1,97 @@
+<Window x:Class="WinOtp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="WinOTP" Height="200" Width="360"
+        MinHeight="140" MinWidth="300"
+        WindowStartupLocation="CenterScreen">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Top toolbar: IMPORT button centered -->
+        <Button Grid.Row="0"
+                x:Name="ImportButton"
+                Content="Import QR"
+                HorizontalAlignment="Center"
+                Padding="16,4"
+                Margin="0,8,0,4"
+                Click="Import_Click" />
+
+        <!-- Account list -->
+        <ListBox Grid.Row="1"
+                 x:Name="AccountsList"
+                 BorderThickness="0"
+                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                 HorizontalContentAlignment="Stretch">
+            <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                    <Setter Property="Focusable" Value="False" />
+                    <Setter Property="Padding" Value="0" />
+                </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Grid Margin="8,6">
+                        <Grid.ContextMenu>
+                            <!-- ContextMenu is a separate visual tree; bind DataContext via PlacementTarget. -->
+                            <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                <MenuItem Header="Delete"
+                                          Click="Delete_Click"
+                                          Tag="{Binding}" />
+                            </ContextMenu>
+                        </Grid.ContextMenu>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Account name -->
+                        <TextBlock Grid.Column="0"
+                                   Text="{Binding Name}"
+                                   VerticalAlignment="Center"
+                                   FontWeight="SemiBold"
+                                   TextTrimming="CharacterEllipsis" />
+
+                        <!-- OTP display (non-selectable; Copy button puts RawCode on clipboard) -->
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding Code}"
+                                   VerticalAlignment="Center"
+                                   Margin="8,0"
+                                   FontFamily="Consolas"
+                                   FontSize="16" />
+
+                        <!-- Countdown -->
+                        <TextBlock Grid.Column="2"
+                                   Text="{Binding CountdownText}"
+                                   VerticalAlignment="Center"
+                                   Foreground="Gray"
+                                   Margin="0,0,8,0" />
+
+                        <!-- Copy button -->
+                        <Button Grid.Column="3"
+                                Content="Copy"
+                                Padding="10,2"
+                                VerticalAlignment="Center"
+                                Margin="0,0,4,0"
+                                Click="Copy_Click"
+                                Tag="{Binding}" />
+
+                        <!-- Delete button -->
+                        <Button Grid.Column="4"
+                                Content="Delete"
+                                Padding="10,2"
+                                VerticalAlignment="Center"
+                                Click="Delete_Click"
+                                Tag="{Binding}" />
+                    </Grid>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+    </Grid>
+</Window>

@@ -1,0 +1,18 @@
+{
+  "accounts": [
+    {
+      "name": "Example (user@example.com)",
+      "secret": "JBSWY3DPEHPK3PXP",
+      "digits": 6,
+      "period": 30,
+      "algorithm": "SHA1"
+    },
+    {
+      "name": "Demo SHA256",
+      "secret": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+      "digits": 8,
+      "period": 30,
+      "algorithm": "SHA256"
+    }
+  ]
+}
