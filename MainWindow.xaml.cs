@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _clipboardClearCts;
     private string? _lastCopiedOtp;
     private bool _accountsLoadFailed;
+    private bool _isSelectionMode;
 
     public MainWindow()
     {
@@ -205,7 +206,8 @@ public partial class MainWindow : Window
 
     private void ApplyVaultSafetyUi()
     {
-        ImportButton.IsEnabled = !_accountsLoadFailed;
+        ImportButton.IsEnabled = !_accountsLoadFailed && !_isSelectionMode;
+        DeleteButton.IsEnabled = !_accountsLoadFailed;
     }
 
     private bool EnsureVaultWritable()
@@ -323,21 +325,30 @@ public partial class MainWindow : Window
             return;
         }
 
-        AccountRow? row = sender switch
+        if (!_isSelectionMode)
         {
-            MenuItem { Tag: AccountRow r } => r,
-            Button { Tag: AccountRow r } => r,
-            _ => null
-        };
-
-        if (row is null)
-        {
+            EnterSelectionMode();
             return;
         }
 
+        List<AccountRow> selected = _rows.Where(r => r.IsSelected).ToList();
+        if (selected.Count == 0)
+        {
+            MessageBox.Show(
+                "Select at least one account to delete.",
+                "Delete accounts",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        string message = selected.Count == 1
+            ? $"Delete account '{selected[0].Name}'?"
+            : $"Delete {selected.Count} selected accounts?";
+
         MessageBoxResult confirm = MessageBox.Show(
-            $"Delete account '{row.Name}'?",
-            "Delete account",
+            message,
+            "Delete accounts",
             MessageBoxButton.YesNo,
             MessageBoxImage.Question,
             MessageBoxResult.No);
@@ -347,39 +358,84 @@ public partial class MainWindow : Window
             return;
         }
 
-        Account account = row.Account;
-        int accountIndex = _accounts.IndexOf(account);
-        int rowIndex = _rows.IndexOf(row);
+        // Snapshot for rollback if save fails.
+        var removed = selected
+            .Select(row => (
+                Row: row,
+                Account: row.Account,
+                AccountIndex: _accounts.IndexOf(row.Account),
+                RowIndex: _rows.IndexOf(row)))
+            .OrderByDescending(x => x.RowIndex)
+            .ToList();
 
-        _accounts.Remove(account);
-        _rows.Remove(row);
+        foreach (var item in removed)
+        {
+            _accounts.Remove(item.Account);
+            _rows.Remove(item.Row);
+        }
 
         if (!SaveAccounts())
         {
-            // Restore so UI stays in sync with the vault on disk.
-            if (accountIndex >= 0 && accountIndex <= _accounts.Count)
+            // Restore so UI stays in sync with the vault on disk (lowest index first).
+            foreach (var item in removed.OrderBy(x => x.RowIndex))
             {
-                _accounts.Insert(accountIndex, account);
-            }
-            else
-            {
-                _accounts.Add(account);
-            }
+                if (item.AccountIndex >= 0 && item.AccountIndex <= _accounts.Count)
+                {
+                    _accounts.Insert(item.AccountIndex, item.Account);
+                }
+                else
+                {
+                    _accounts.Add(item.Account);
+                }
 
-            if (rowIndex >= 0 && rowIndex <= _rows.Count)
-            {
-                _rows.Insert(rowIndex, row);
-            }
-            else
-            {
-                _rows.Add(row);
+                if (item.RowIndex >= 0 && item.RowIndex <= _rows.Count)
+                {
+                    _rows.Insert(item.RowIndex, item.Row);
+                }
+                else
+                {
+                    _rows.Add(item.Row);
+                }
             }
 
             MessageBox.Show(
-                "Could not save after delete. The account was restored in the list. " +
+                "Could not save after delete. The accounts were restored in the list. " +
                 "Your vault on disk was not changed.",
                 "WinOTP", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
         }
+
+        ExitSelectionMode();
+    }
+
+    private void CancelDelete_Click(object sender, RoutedEventArgs e) => ExitSelectionMode();
+
+    private void EnterSelectionMode()
+    {
+        _isSelectionMode = true;
+        foreach (AccountRow row in _rows)
+        {
+            row.IsSelected = false;
+            row.IsSelectionMode = true;
+        }
+
+        DeleteButton.Content = "Delete Selected";
+        CancelDeleteButton.Visibility = Visibility.Visible;
+        ApplyVaultSafetyUi();
+    }
+
+    private void ExitSelectionMode()
+    {
+        _isSelectionMode = false;
+        foreach (AccountRow row in _rows)
+        {
+            row.IsSelected = false;
+            row.IsSelectionMode = false;
+        }
+
+        DeleteButton.Content = "Delete";
+        CancelDeleteButton.Visibility = Visibility.Collapsed;
+        ApplyVaultSafetyUi();
     }
 
     private void Import_Click(object sender, RoutedEventArgs e)
@@ -691,6 +747,8 @@ public sealed class AccountRow : INotifyPropertyChanged
     private string _code = "";
     private string _countdownText = "";
     private int _remainingSeconds = -1;
+    private bool _isSelected;
+    private bool _isSelectionMode;
 
     public AccountRow(Account account)
     {
@@ -700,6 +758,38 @@ public sealed class AccountRow : INotifyPropertyChanged
     public Account Account => _account;
 
     public string Name => _account.Name;
+
+    /// <summary>Whether this row is checked for bulk delete.</summary>
+    public bool IsSelected
+    {
+        get => _isSelected;
+        set
+        {
+            if (_isSelected == value)
+            {
+                return;
+            }
+
+            _isSelected = value;
+            OnPropertyChanged(nameof(IsSelected));
+        }
+    }
+
+    /// <summary>Whether delete-selection checkboxes are shown.</summary>
+    public bool IsSelectionMode
+    {
+        get => _isSelectionMode;
+        set
+        {
+            if (_isSelectionMode == value)
+            {
+                return;
+            }
+
+            _isSelectionMode = value;
+            OnPropertyChanged(nameof(IsSelectionMode));
+        }
+    }
 
     /// <summary>Code as displayed, grouped for readability (e.g. "492 810").</summary>
     public string Code

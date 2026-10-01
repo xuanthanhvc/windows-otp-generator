@@ -4,20 +4,39 @@
         Title="WinOTP" Height="200" Width="360"
         MinHeight="140" MinWidth="300"
         WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+    </Window.Resources>
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <!-- Top toolbar: IMPORT button centered -->
-        <Button Grid.Row="0"
-                x:Name="ImportButton"
-                Content="Import QR"
-                HorizontalAlignment="Center"
-                Padding="16,4"
-                Margin="0,8,0,4"
-                Click="Import_Click" />
+        <!-- Top toolbar: Import + Delete (same size), Cancel when selecting -->
+        <StackPanel Grid.Row="0"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Left"
+                    Margin="8,8,8,4">
+            <Button x:Name="ImportButton"
+                    Content="Import QR"
+                    Width="130"
+                    Padding="16,4"
+                    Margin="0,0,8,0"
+                    Click="Import_Click" />
+            <Button x:Name="DeleteButton"
+                    Content="Delete"
+                    Width="130"
+                    Padding="16,4"
+                    Margin="0,0,8,0"
+                    Click="Delete_Click" />
+            <Button x:Name="CancelDeleteButton"
+                    Content="Cancel"
+                    Width="130"
+                    Padding="16,4"
+                    Visibility="Collapsed"
+                    Click="CancelDelete_Click" />
+        </StackPanel>
 
         <!-- Account list -->
         <ListBox Grid.Row="1"
@@ -35,31 +54,30 @@
             <ListBox.ItemTemplate>
                 <DataTemplate>
                     <Grid Margin="8,6">
-                        <Grid.ContextMenu>
-                            <!-- ContextMenu is a separate visual tree; bind DataContext via PlacementTarget. -->
-                            <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
-                                <MenuItem Header="Delete"
-                                          Click="Delete_Click"
-                                          Tag="{Binding}" />
-                            </ContextMenu>
-                        </Grid.ContextMenu>
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
 
+                        <!-- Selection checkbox (visible only in delete mode) -->
+                        <CheckBox Grid.Column="0"
+                                  IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                  VerticalAlignment="Center"
+                                  Margin="0,0,8,0"
+                                  Visibility="{Binding IsSelectionMode, Converter={StaticResource BoolToVis}}" />
+
                         <!-- Account name -->
-                        <TextBlock Grid.Column="0"
+                        <TextBlock Grid.Column="1"
                                    Text="{Binding Name}"
                                    VerticalAlignment="Center"
                                    FontWeight="SemiBold"
                                    TextTrimming="CharacterEllipsis" />
 
                         <!-- OTP display (non-selectable; Copy button puts RawCode on clipboard) -->
-                        <TextBlock Grid.Column="1"
+                        <TextBlock Grid.Column="2"
                                    Text="{Binding Code}"
                                    VerticalAlignment="Center"
                                    Margin="8,0"
@@ -67,27 +85,18 @@
                                    FontSize="16" />
 
                         <!-- Countdown -->
-                        <TextBlock Grid.Column="2"
+                        <TextBlock Grid.Column="3"
                                    Text="{Binding CountdownText}"
                                    VerticalAlignment="Center"
                                    Foreground="Gray"
                                    Margin="0,0,8,0" />
 
                         <!-- Copy button -->
-                        <Button Grid.Column="3"
+                        <Button Grid.Column="4"
                                 Content="Copy"
                                 Padding="10,2"
                                 VerticalAlignment="Center"
-                                Margin="0,0,4,0"
                                 Click="Copy_Click"
-                                Tag="{Binding}" />
-
-                        <!-- Delete button -->
-                        <Button Grid.Column="4"
-                                Content="Delete"
-                                Padding="10,2"
-                                VerticalAlignment="Center"
-                                Click="Delete_Click"
                                 Tag="{Binding}" />
                     </Grid>
                 </DataTemplate>
