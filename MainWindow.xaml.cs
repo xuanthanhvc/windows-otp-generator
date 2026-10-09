@@ -5,96 +5,179 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using ZXing;
-
 namespace WinOtp;
 
 public partial class MainWindow : Window
 {
     private readonly ObservableCollection<AccountRow> _rows = new();
     private readonly List<Account> _accounts = new();
+    private readonly CollectionView _rowsView;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly AppSettings _settings;
+
     private CancellationTokenSource? _clipboardClearCts;
     private string? _lastCopiedOtp;
     private bool _accountsLoadFailed;
     private bool _isSelectionMode;
+    private bool _searchOpen;
+    private string _searchQuery = "";
+    private AccountRow? _dragSource;
+    private AccountRow? _renamingRow;
+    private string? _renameOriginal;
+    private TrayIconHost? _tray;
+    private bool _forceExit;
 
     public MainWindow()
     {
         InitializeComponent();
-        AccountsList.ItemsSource = _rows;
+
+        _settings = AppSettingsStore.Load();
+        ApplyWindowGeometry();
+        ApplyAppPreferences();
+
+        _rowsView = (CollectionView)CollectionViewSource.GetDefaultView(_rows);
+        _rowsView.Filter = FilterRow;
+        AccountsList.ItemsSource = _rowsView;
 
         AccountStore.EnsureDataDirectory();
-        RestoreWindowBounds();
         Closing += Window_Closing;
 
         LoadAccounts();
         ApplyVaultSafetyUi();
+        UpdateListChrome();
 
         _timer.Tick += Timer_Tick;
         _timer.Start();
         Refresh();
     }
 
+    public void RequestShutdown()
+    {
+        _forceExit = true;
+        _tray?.Dispose();
+        _tray = null;
+        Application.Current.Shutdown();
+    }
+
+    private bool FilterRow(object item)
+    {
+        if (item is not AccountRow row)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(_searchQuery))
+        {
+            return true;
+        }
+
+        return row.Name.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private IReadOnlyList<AccountRow> GetVisibleRows() =>
+        _rowsView.Cast<AccountRow>().ToList();
+
+    private void UpdateListChrome()
+    {
+        bool hasAccounts = _rows.Count > 0;
+        SearchToggleButton.Visibility = hasAccounts ? Visibility.Visible : Visibility.Collapsed;
+
+        if (!hasAccounts)
+        {
+            CloseSearch();
+        }
+
+        int visible = GetVisibleRows().Count;
+        EmptyStateText.Visibility = !hasAccounts ? Visibility.Visible : Visibility.Collapsed;
+        NoMatchText.Visibility = hasAccounts && visible == 0 && !string.IsNullOrWhiteSpace(_searchQuery)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        AccountsList.Visibility = hasAccounts && visible > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     private void Timer_Tick(object? sender, EventArgs e) => Refresh();
 
-    /// <summary>Restores the saved window size, position and maximized state, if any.</summary>
-    private void RestoreWindowBounds()
+    private void ApplyWindowGeometry()
     {
         try
         {
-            // EnsureDataDirectory migrates window.json from beside the EXE when needed.
-            string path = AccountStore.WindowStatePath;
-            if (!File.Exists(path) && File.Exists(AccountStore.PortableWindowStatePath))
+            if (_settings.Width >= MinWidth)
             {
-                path = AccountStore.PortableWindowStatePath;
+                Width = _settings.Width;
             }
 
-            if (!File.Exists(path))
+            if (_settings.Height >= MinHeight)
             {
-                return;
+                Height = _settings.Height;
             }
 
-            var saved = JsonSerializer.Deserialize<WindowBounds>(File.ReadAllText(path));
-            if (saved is null)
-            {
-                return;
-            }
-
-            // Only apply a size that respects the window's minimums.
-            if (saved.Width >= MinWidth)
-            {
-                Width = saved.Width;
-            }
-            if (saved.Height >= MinHeight)
-            {
-                Height = saved.Height;
-            }
-
-            // Restore position only if it lands within the visible virtual screen.
-            if (saved.Left.HasValue && saved.Top.HasValue &&
-                IsOnScreen(saved.Left.Value, saved.Top.Value, Width, Height))
+            if (_settings.Left.HasValue && _settings.Top.HasValue &&
+                IsOnScreen(_settings.Left.Value, _settings.Top.Value, Width, Height))
             {
                 WindowStartupLocation = WindowStartupLocation.Manual;
-                Left = saved.Left.Value;
-                Top = saved.Top.Value;
+                Left = _settings.Left.Value;
+                Top = _settings.Top.Value;
             }
 
-            if (saved.Maximized)
+            if (_settings.Maximized)
             {
                 WindowState = WindowState.Maximized;
             }
         }
         catch
         {
-            // A corrupt window.json should never stop the app from opening.
+            // Corrupt window.json should never stop the app from opening.
         }
     }
 
-    /// <summary>True if the given rectangle is at least partially on a screen.</summary>
+    private void ApplyAppPreferences()
+    {
+        Topmost = _settings.AlwaysOnTop;
+        ApplyTrayIcon();
+    }
+
+    private void ApplyTrayIcon()
+    {
+        if (_settings.MinimizeToTray)
+        {
+            _tray ??= new TrayIconHost(this);
+        }
+        else
+        {
+            _tray?.Dispose();
+            _tray = null;
+        }
+    }
+
+    private void SaveAppSettings()
+    {
+        try
+        {
+            Rect bounds = WindowState == WindowState.Normal
+                ? new Rect(Left, Top, Width, Height)
+                : RestoreBounds;
+
+            _settings.Left = bounds.Left;
+            _settings.Top = bounds.Top;
+            _settings.Width = bounds.Width;
+            _settings.Height = bounds.Height;
+            _settings.Maximized = WindowState == WindowState.Maximized;
+
+            AppSettingsStore.Save(_settings);
+        }
+        catch
+        {
+            // Non-critical.
+        }
+    }
+
     private static bool IsOnScreen(double left, double top, double width, double height)
     {
         double vLeft = SystemParameters.VirtualScreenLeft;
@@ -102,13 +185,20 @@ public partial class MainWindow : Window
         double vRight = vLeft + SystemParameters.VirtualScreenWidth;
         double vBottom = vTop + SystemParameters.VirtualScreenHeight;
 
-        // Require a reasonable overlap so the title bar stays grabbable.
         return left < vRight - 40 && left + width > vLeft + 40 &&
                top < vBottom - 40 && top + height > vTop + 40;
     }
 
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (!_forceExit && _settings.MinimizeToTray)
+        {
+            e.Cancel = true;
+            SaveAppSettings();
+            Hide();
+            return;
+        }
+
         _timer.Stop();
         _timer.Tick -= Timer_Tick;
         _clipboardClearCts?.Cancel();
@@ -116,32 +206,262 @@ public partial class MainWindow : Window
         _clipboardClearCts = null;
 
         ClearClipboardIfHoldsLastOtp();
+        SaveAppSettings();
+        _tray?.Dispose();
+        _tray = null;
+
+        if (!_forceExit)
+        {
+            Application.Current.Shutdown();
+        }
+    }
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            if (_searchOpen)
+            {
+                CloseSearch();
+                e.Handled = true;
+                return;
+            }
+
+            if (_renamingRow is not null)
+            {
+                CancelRename();
+                e.Handled = true;
+                return;
+            }
+
+            if (_isSelectionMode)
+            {
+                ExitSelectionMode();
+                e.Handled = true;
+            }
+
+            return;
+        }
+
+        if (Keyboard.Modifiers == ModifierKeys.Control && e.Key == Key.F)
+        {
+            if (_rows.Count > 0)
+            {
+                OpenSearch();
+            }
+
+            e.Handled = true;
+            return;
+        }
+
+        if (Keyboard.Modifiers == ModifierKeys.Control &&
+            e.Key is >= Key.D1 and <= Key.D9)
+        {
+            int index = e.Key - Key.D1;
+            CopyVisibleRowAt(index);
+            e.Handled = true;
+        }
+    }
+
+    private void CopyVisibleRowAt(int zeroBasedIndex)
+    {
+        IReadOnlyList<AccountRow> visible = GetVisibleRows();
+        if (zeroBasedIndex < 0 || zeroBasedIndex >= visible.Count)
+        {
+            return;
+        }
+
+        CopyCode(visible[zeroBasedIndex]);
+    }
+
+    private void SearchToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (_searchOpen)
+        {
+            CloseSearch();
+        }
+        else
+        {
+            OpenSearch();
+        }
+    }
+
+    private void OpenSearch()
+    {
+        _searchOpen = true;
+        SearchBox.Visibility = Visibility.Visible;
+        SearchToggleButton.FontWeight = FontWeights.Bold;
+        SearchBox.Focus();
+        SearchBox.SelectAll();
+    }
+
+    private void CloseSearch()
+    {
+        _searchOpen = false;
+        _searchQuery = "";
+        SearchBox.Text = "";
+        SearchBox.Visibility = Visibility.Collapsed;
+        SearchToggleButton.FontWeight = FontWeights.Normal;
+        _rowsView.Refresh();
+        UpdateListChrome();
+    }
+
+    private void SearchBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            CloseSearch();
+            e.Handled = true;
+        }
+    }
+
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (sender is TextBox box)
+        {
+            _searchQuery = box.Text;
+            _rowsView.Refresh();
+            UpdateListChrome();
+        }
+    }
+
+    private void SettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SettingsWindow(_settings) { Owner = this };
+        if (dialog.ShowDialog() == true)
+        {
+            _settings.AlwaysOnTop = dialog.AlwaysOnTop;
+            _settings.MinimizeToTray = dialog.MinimizeToTray;
+            Topmost = _settings.AlwaysOnTop;
+            ApplyTrayIcon();
+            SaveAppSettings();
+        }
+    }
+
+    private void ImportButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (ImportButton.ContextMenu is ContextMenu menu)
+        {
+            menu.PlacementTarget = ImportButton;
+            menu.IsOpen = true;
+        }
+    }
+
+    private void ImportQr_Click(object sender, RoutedEventArgs e)
+    {
+        if (!EnsureVaultWritable())
+        {
+            return;
+        }
+
+        var dialog = new OpenFileDialog
+        {
+            Title = "Import QR code image",
+            Filter = "Images (*.png;*.jpg;*.jpeg)|*.png;*.jpg;*.jpeg|All files (*.*)|*.*"
+        };
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
 
         try
         {
-            // RestoreBounds holds the normal (un-maximized) size/position even when maximized.
-            Rect bounds = WindowState == WindowState.Normal
-                ? new Rect(Left, Top, Width, Height)
-                : RestoreBounds;
-
-            var state = new WindowBounds
+            string? qrText = DecodeQr(dialog.FileName);
+            if (string.IsNullOrWhiteSpace(qrText))
             {
-                Left = bounds.Left,
-                Top = bounds.Top,
-                Width = bounds.Width,
-                Height = bounds.Height,
-                Maximized = WindowState == WindowState.Maximized
-            };
+                MessageBox.Show("No QR code was found in the selected image.", "Import",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
 
-            AccountStore.EnsureDataDirectory();
-            AtomicFile.WriteAllText(
-                AccountStore.WindowStatePath,
-                JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+            Account? account = ParseOtpAuth(qrText);
+            if (account is null)
+            {
+                MessageBox.Show(
+                    "The QR code does not contain a valid otpauth:// TOTP entry.",
+                    "Import", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            Totp.Base32Decode(account.Secret);
+            TryAddAccount(account);
         }
-        catch
+        catch (Exception ex)
         {
-            // Failing to save window state must not block closing.
+            MessageBox.Show($"Could not import QR code:\n{ex.Message}", "Import",
+                MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    private void ImportSecret_Click(object sender, RoutedEventArgs e)
+    {
+        if (!EnsureVaultWritable())
+        {
+            return;
+        }
+
+        var dialog = new ImportSecretWindow { Owner = this };
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        var account = new Account
+        {
+            Name = dialog.AccountName,
+            Secret = dialog.Secret,
+            Digits = dialog.Digits,
+            Period = dialog.Period,
+            Algorithm = "SHA1"
+        };
+
+        try
+        {
+            Totp.Base32Decode(account.Secret);
+            TryAddAccount(account);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not import secret:\n{ex.Message}", "Import",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void TryAddAccount(Account account)
+    {
+        if (HasDuplicateSecret(account.Secret))
+        {
+            MessageBoxResult dup = MessageBox.Show(
+                $"An account with the same secret already exists.\n\nImport '{account.Name}' anyway?",
+                "Import",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+
+            if (dup != MessageBoxResult.Yes)
+            {
+                return;
+            }
+        }
+
+        _accounts.Add(account);
+        var row = new AccountRow(account);
+        _rows.Add(row);
+
+        if (!SaveAccounts())
+        {
+            _accounts.Remove(account);
+            _rows.Remove(row);
+            MessageBox.Show(
+                "Import succeeded in memory but saving the vault failed. " +
+                "The new account was rolled back and was not kept.",
+                "Import", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        Refresh();
+        UpdateListChrome();
     }
 
     private void LoadAccounts()
@@ -165,8 +485,6 @@ public partial class MainWindow : Window
             var invalidDigits = new List<string>();
             foreach (Account account in config.Accounts)
             {
-                // Keep invalid-digit accounts in memory so a later save cannot drop them,
-                // but surface a warning and let the row show an error instead of wrong codes.
                 if (!Totp.IsSupportedDigits(account.Digits))
                 {
                     invalidDigits.Add($"'{account.Name}' (digits={account.Digits})");
@@ -234,32 +552,48 @@ public partial class MainWindow : Window
 
     private void Copy_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is Button { Tag: AccountRow row } && !string.IsNullOrEmpty(row.RawCode))
+        if (sender is Button { Tag: AccountRow row })
         {
-            try
-            {
-                string code = row.RawCode;
-                Clipboard.SetText(code);
-                _lastCopiedOtp = code;
-                ScheduleClipboardClear(code);
-            }
-            catch
-            {
-                // Clipboard can occasionally be locked by another process; ignore.
-            }
+            CopyCode(row);
         }
     }
 
-    /// <summary>
-    /// Clears the clipboard after ~30s only if it still holds the copied OTP.
-    /// </summary>
+    private void Code_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: AccountRow row })
+        {
+            CopyCode(row);
+            e.Handled = true;
+        }
+    }
+
+    private void CopyCode(AccountRow row)
+    {
+        if (string.IsNullOrEmpty(row.RawCode))
+        {
+            return;
+        }
+
+        try
+        {
+            string code = row.RawCode;
+            Clipboard.SetText(code);
+            _lastCopiedOtp = code;
+            ScheduleClipboardClear(code);
+            row.ShowCopiedFeedback();
+        }
+        catch
+        {
+            // Clipboard can occasionally be locked by another process; ignore.
+        }
+    }
+
     private void ScheduleClipboardClear(string code)
     {
         _clipboardClearCts?.Cancel();
         _clipboardClearCts?.Dispose();
         _clipboardClearCts = new CancellationTokenSource();
         CancellationToken token = _clipboardClearCts.Token;
-
         _ = ClearClipboardLaterAsync(code, token);
     }
 
@@ -331,7 +665,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        List<AccountRow> selected = _rows.Where(r => r.IsSelected).ToList();
+        DeleteRows(_rows.Where(r => r.IsSelected).ToList());
+    }
+
+    private void RowDeleteMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (!EnsureVaultWritable())
+        {
+            return;
+        }
+
+        if (sender is MenuItem { Tag: AccountRow row })
+        {
+            DeleteRows(new List<AccountRow> { row });
+        }
+    }
+
+    private void DeleteRows(List<AccountRow> selected)
+    {
         if (selected.Count == 0)
         {
             MessageBox.Show(
@@ -346,19 +697,12 @@ public partial class MainWindow : Window
             ? $"Delete account '{selected[0].Name}'?"
             : $"Delete {selected.Count} selected accounts?";
 
-        MessageBoxResult confirm = MessageBox.Show(
-            message,
-            "Delete accounts",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question,
-            MessageBoxResult.No);
-
-        if (confirm != MessageBoxResult.Yes)
+        if (MessageBox.Show(message, "Delete accounts", MessageBoxButton.YesNo,
+                MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes)
         {
             return;
         }
 
-        // Snapshot for rollback if save fails.
         var removed = selected
             .Select(row => (
                 Row: row,
@@ -376,7 +720,6 @@ public partial class MainWindow : Window
 
         if (!SaveAccounts())
         {
-            // Restore so UI stays in sync with the vault on disk (lowest index first).
             foreach (var item in removed.OrderBy(x => x.RowIndex))
             {
                 if (item.AccountIndex >= 0 && item.AccountIndex <= _accounts.Count)
@@ -402,16 +745,19 @@ public partial class MainWindow : Window
                 "Could not save after delete. The accounts were restored in the list. " +
                 "Your vault on disk was not changed.",
                 "WinOTP", MessageBoxButton.OK, MessageBoxImage.Error);
+            UpdateListChrome();
             return;
         }
 
         ExitSelectionMode();
+        UpdateListChrome();
     }
 
     private void CancelDelete_Click(object sender, RoutedEventArgs e) => ExitSelectionMode();
 
     private void EnterSelectionMode()
     {
+        CancelRename();
         _isSelectionMode = true;
         foreach (AccountRow row in _rows)
         {
@@ -419,7 +765,6 @@ public partial class MainWindow : Window
             row.IsSelectionMode = true;
         }
 
-        DeleteButton.Content = "Delete Selected";
         CancelDeleteButton.Visibility = Visibility.Visible;
         ApplyVaultSafetyUi();
     }
@@ -433,91 +778,199 @@ public partial class MainWindow : Window
             row.IsSelectionMode = false;
         }
 
-        DeleteButton.Content = "Delete";
         CancelDeleteButton.Visibility = Visibility.Collapsed;
         ApplyVaultSafetyUi();
     }
 
-    private void Import_Click(object sender, RoutedEventArgs e)
+    private void RenameMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { Tag: AccountRow row })
+        {
+            BeginRename(row);
+        }
+    }
+
+    private void BeginRename(AccountRow row)
+    {
+        if (!EnsureVaultWritable() || _isSelectionMode)
+        {
+            return;
+        }
+
+        CancelRename();
+        _renamingRow = row;
+        _renameOriginal = row.Name;
+        row.IsRenaming = true;
+        // Focus happens in RenameBox_IsVisibleChanged once the TextBox is shown.
+    }
+
+    private void RenameBox_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (sender is not TextBox box || box.Visibility != Visibility.Visible)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Input, () =>
+        {
+            if (!box.IsVisible)
+            {
+                return;
+            }
+
+            box.Focus();
+            box.SelectAll();
+        });
+    }
+
+    private void CommitRename(AccountRow row)
+    {
+        row.IsRenaming = false;
+        if (ReferenceEquals(_renamingRow, row))
+        {
+            _renamingRow = null;
+            _renameOriginal = null;
+        }
+
+        if (string.IsNullOrWhiteSpace(row.Name))
+        {
+            MessageBox.Show("Account name cannot be empty.", "Rename",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (_renameOriginal is not null)
+            {
+                row.Name = _renameOriginal;
+            }
+
+            _renamingRow = null;
+            _renameOriginal = null;
+            return;
+        }
+
+        row.Name = row.Name.Trim();
+        SaveAccounts();
+    }
+
+    private void CancelRename()
+    {
+        if (_renamingRow is null)
+        {
+            return;
+        }
+
+        _renamingRow.IsRenaming = false;
+        if (_renameOriginal is not null)
+        {
+            _renamingRow.Name = _renameOriginal;
+        }
+
+        _renamingRow = null;
+        _renameOriginal = null;
+    }
+
+    private void RenameBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is not TextBox { Tag: AccountRow row })
+        {
+            return;
+        }
+
+        if (e.Key == Key.Enter)
+        {
+            CommitRename(row);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            CancelRename();
+            e.Handled = true;
+        }
+    }
+
+    private void RenameBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (sender is TextBox { Tag: AccountRow row } && row.IsRenaming)
+        {
+            CommitRename(row);
+        }
+    }
+
+    private void DragHandle_MouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_isSelectionMode)
+        {
+            return;
+        }
+
+        if (sender is FrameworkElement { Tag: AccountRow row })
+        {
+            _dragSource = row;
+        }
+    }
+
+    private void DragHandle_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (_dragSource is null || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        if (sender is not FrameworkElement fe || fe.Tag is not AccountRow row || !ReferenceEquals(row, _dragSource))
+        {
+            return;
+        }
+
+        DragDrop.DoDragDrop(fe, row, DragDropEffects.Move);
+        _dragSource = null;
+    }
+
+    private void AccountsList_DragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = e.Data.GetDataPresent(typeof(AccountRow)) ? DragDropEffects.Move : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void AccountsList_Drop(object sender, DragEventArgs e)
     {
         if (!EnsureVaultWritable())
         {
             return;
         }
 
-        var dialog = new OpenFileDialog
-        {
-            Title = "Import QR code image",
-            Filter = "Images (*.png;*.jpg;*.jpeg)|*.png;*.jpg;*.jpeg|All files (*.*)|*.*"
-        };
-
-        if (dialog.ShowDialog(this) != true)
+        if (e.Data.GetData(typeof(AccountRow)) is not AccountRow source)
         {
             return;
         }
 
-        try
+        Point pos = e.GetPosition(AccountsList);
+        HitTestResult? hit = VisualTreeHelper.HitTest(AccountsList, pos);
+        DependencyObject? current = hit?.VisualHit;
+        while (current is not null and not ListBoxItem)
         {
-            string? qrText = DecodeQr(dialog.FileName);
-            if (string.IsNullOrWhiteSpace(qrText))
-            {
-                MessageBox.Show("No QR code was found in the selected image.", "Import QR",
-                    MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            Account? account = ParseOtpAuth(qrText);
-            if (account is null)
-            {
-                MessageBox.Show(
-                    "The QR code does not contain a valid otpauth:// TOTP entry.",
-                    "Import QR", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            // Validate the secret decodes before accepting it.
-            Totp.Base32Decode(account.Secret);
-
-            if (HasDuplicateSecret(account.Secret))
-            {
-                MessageBoxResult dup = MessageBox.Show(
-                    $"An account with the same secret already exists.\n\nImport '{account.Name}' anyway?",
-                    "Import QR",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Warning,
-                    MessageBoxResult.No);
-
-                if (dup != MessageBoxResult.Yes)
-                {
-                    return;
-                }
-            }
-
-            _accounts.Add(account);
-            var row = new AccountRow(account);
-            _rows.Add(row);
-
-            if (!SaveAccounts())
-            {
-                _accounts.Remove(account);
-                _rows.Remove(row);
-                MessageBox.Show(
-                    "Import succeeded in memory but saving the vault failed. " +
-                    "The new account was rolled back and was not kept.",
-                    "Import QR", MessageBoxButton.OK, MessageBoxImage.Error);
-                return;
-            }
-
-            Refresh();
-
-            MessageBox.Show($"Imported '{account.Name}'.", "Import QR",
-                MessageBoxButton.OK, MessageBoxImage.Information);
+            current = VisualTreeHelper.GetParent(current);
         }
-        catch (Exception ex)
+
+        if (current is not ListBoxItem { DataContext: AccountRow target })
         {
-            MessageBox.Show($"Could not import QR code:\n{ex.Message}", "Import QR",
-                MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
         }
+
+        ReorderRows(source, target);
+    }
+
+    private void ReorderRows(AccountRow source, AccountRow target)
+    {
+        int oldIndex = _rows.IndexOf(source);
+        int newIndex = _rows.IndexOf(target);
+        if (oldIndex < 0 || newIndex < 0 || oldIndex == newIndex)
+        {
+            return;
+        }
+
+        _rows.Move(oldIndex, newIndex);
+        Account account = _accounts[oldIndex];
+        _accounts.RemoveAt(oldIndex);
+        _accounts.Insert(newIndex, account);
+        SaveAccounts();
     }
 
     private bool HasDuplicateSecret(string secret)
@@ -530,10 +983,8 @@ public partial class MainWindow : Window
     private static string NormalizeSecretKey(string secret) =>
         secret.Trim().Replace(" ", "").Replace("-", "").TrimEnd('=').ToUpperInvariant();
 
-    /// <summary>Decodes the first QR/barcode found in an image file. Returns null if none.</summary>
     private static string? DecodeQr(string imagePath)
     {
-        // Load the image via WPF imaging (handles PNG and JPG natively, no System.Drawing).
         BitmapImage source = new();
         using (FileStream stream = File.OpenRead(imagePath))
         {
@@ -543,8 +994,7 @@ public partial class MainWindow : Window
             source.EndInit();
         }
 
-        // Convert to a known 32bpp BGRA format so we can hand raw bytes to ZXing.
-        FormatConvertedBitmap converted = new(source, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+        FormatConvertedBitmap converted = new(source, PixelFormats.Bgra32, null, 0);
         int width = converted.PixelWidth;
         int height = converted.PixelHeight;
         int stride = width * 4;
@@ -567,11 +1017,6 @@ public partial class MainWindow : Window
         return result?.Text;
     }
 
-    /// <summary>
-    /// Parses an otpauth://totp/Label?secret=...&amp;issuer=...&amp;digits=...&amp;period=...&amp;algorithm=...
-    /// URI into an Account. Returns null if it is not a valid TOTP URI.
-    /// Throws if digits are present but outside the supported 6–8 range.
-    /// </summary>
     private static Account? ParseOtpAuth(string uriText)
     {
         if (!Uri.TryCreate(uriText, UriKind.Absolute, out Uri? uri))
@@ -584,7 +1029,6 @@ public partial class MainWindow : Window
             return null;
         }
 
-        // Only time-based OTP is supported by this tool.
         if (!string.Equals(uri.Host, "totp", StringComparison.OrdinalIgnoreCase))
         {
             return null;
@@ -596,7 +1040,6 @@ public partial class MainWindow : Window
             return null;
         }
 
-        // Label is the path, often "Issuer:account@example.com".
         string label = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/'));
         query.TryGetValue("issuer", out string? issuer);
 
@@ -631,7 +1074,6 @@ public partial class MainWindow : Window
         return account;
     }
 
-    /// <summary>Minimal query-string parser (avoids System.Web dependency).</summary>
     private static Dictionary<string, string> ParseQuery(string query)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -657,10 +1099,8 @@ public partial class MainWindow : Window
         return result;
     }
 
-    /// <summary>Builds a friendly display name from the issuer parameter and the QR label.</summary>
     private static string BuildName(string? issuer, string label)
     {
-        // Label may already be "Issuer:account". Split it out.
         string labelIssuer = "";
         string labelAccount = label;
         int colon = label.IndexOf(':');
@@ -676,17 +1116,15 @@ public partial class MainWindow : Window
         {
             return $"{finalIssuer} ({labelAccount})";
         }
+
         if (!string.IsNullOrWhiteSpace(finalIssuer))
         {
             return finalIssuer;
         }
+
         return labelAccount;
     }
 
-    /// <summary>
-    /// Persists the current account list to the encrypted LocalAppData store.
-    /// Returns false when the vault is locked after a failed load, or when the write fails.
-    /// </summary>
     private bool SaveAccounts()
     {
         if (_accountsLoadFailed)
@@ -713,24 +1151,12 @@ public partial class MainWindow : Window
     }
 }
 
-/// <summary>Root of the accounts config document.</summary>
 public sealed class Config
 {
     [JsonPropertyName("accounts")]
     public List<Account>? Accounts { get; set; }
 }
 
-/// <summary>Persisted window size, position and maximized state (window.json).</summary>
-public sealed class WindowBounds
-{
-    public double? Left { get; set; }
-    public double? Top { get; set; }
-    public double Width { get; set; }
-    public double Height { get; set; }
-    public bool Maximized { get; set; }
-}
-
-/// <summary>A single configured account.</summary>
 public sealed class Account
 {
     public string Name { get; set; } = "";
@@ -740,15 +1166,29 @@ public sealed class Account
     public string Algorithm { get; set; } = "SHA1";
 }
 
-/// <summary>Display row with live-updating code and countdown.</summary>
 public sealed class AccountRow : INotifyPropertyChanged
 {
+    private static readonly Brush CountdownNormalBrush = new SolidColorBrush(Color.FromRgb(0x80, 0x80, 0x80));
+    private static readonly Brush CountdownWarnBrush = new SolidColorBrush(Color.FromRgb(0xC0, 0x6C, 0x00));
+    private static readonly Brush CountdownUrgentBrush = new SolidColorBrush(Color.FromRgb(0xC6, 0x28, 0x28));
+
     private readonly Account _account;
     private string _code = "";
     private string _countdownText = "";
     private int _remainingSeconds = -1;
     private bool _isSelected;
     private bool _isSelectionMode;
+    private bool _isRenaming;
+    private string _copyButtonText = "Copy";
+    private Brush _countdownBrush = CountdownNormalBrush;
+    private CancellationTokenSource? _copiedFeedbackCts;
+
+    static AccountRow()
+    {
+        CountdownNormalBrush.Freeze();
+        CountdownWarnBrush.Freeze();
+        CountdownUrgentBrush.Freeze();
+    }
 
     public AccountRow(Account account)
     {
@@ -757,9 +1197,23 @@ public sealed class AccountRow : INotifyPropertyChanged
 
     public Account Account => _account;
 
-    public string Name => _account.Name;
+    public string Name
+    {
+        get => _account.Name;
+        set
+        {
+            if (_account.Name == value)
+            {
+                return;
+            }
 
-    /// <summary>Whether this row is checked for bulk delete.</summary>
+            _account.Name = value;
+            OnPropertyChanged(nameof(Name));
+        }
+    }
+
+    public void RefreshNameFromAccount() => OnPropertyChanged(nameof(Name));
+
     public bool IsSelected
     {
         get => _isSelected;
@@ -775,7 +1229,6 @@ public sealed class AccountRow : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Whether delete-selection checkboxes are shown.</summary>
     public bool IsSelectionMode
     {
         get => _isSelectionMode;
@@ -788,10 +1241,27 @@ public sealed class AccountRow : INotifyPropertyChanged
 
             _isSelectionMode = value;
             OnPropertyChanged(nameof(IsSelectionMode));
+            OnPropertyChanged(nameof(ShowDragHandle));
         }
     }
 
-    /// <summary>Code as displayed, grouped for readability (e.g. "492 810").</summary>
+    public bool IsRenaming
+    {
+        get => _isRenaming;
+        set
+        {
+            if (_isRenaming == value)
+            {
+                return;
+            }
+
+            _isRenaming = value;
+            OnPropertyChanged(nameof(IsRenaming));
+        }
+    }
+
+    public bool ShowDragHandle => !_isSelectionMode;
+
     public string Code
     {
         get => _code;
@@ -807,7 +1277,6 @@ public sealed class AccountRow : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Code as digits only, for clipboard.</summary>
     public string RawCode { get; private set; } = "";
 
     public string CountdownText
@@ -825,14 +1294,84 @@ public sealed class AccountRow : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Seconds left in the current TOTP step (always refreshed each tick).</summary>
+    public Brush CountdownBrush
+    {
+        get => _countdownBrush;
+        private set
+        {
+            if (ReferenceEquals(_countdownBrush, value))
+            {
+                return;
+            }
+
+            _countdownBrush = value;
+            OnPropertyChanged(nameof(CountdownBrush));
+        }
+    }
+
+    public string CopyButtonText
+    {
+        get => _copyButtonText;
+        private set
+        {
+            if (_copyButtonText == value)
+            {
+                return;
+            }
+
+            _copyButtonText = value;
+            OnPropertyChanged(nameof(CopyButtonText));
+        }
+    }
+
     public int RemainingSeconds
     {
         get => _remainingSeconds;
         private set
         {
+            if (_remainingSeconds == value)
+            {
+                return;
+            }
+
             _remainingSeconds = value;
             OnPropertyChanged(nameof(RemainingSeconds));
+            CountdownBrush = value switch
+            {
+                <= 5 => CountdownUrgentBrush,
+                <= 10 => CountdownWarnBrush,
+                _ => CountdownNormalBrush
+            };
+        }
+    }
+
+    public void ShowCopiedFeedback()
+    {
+        _copiedFeedbackCts?.Cancel();
+        _copiedFeedbackCts?.Dispose();
+        _copiedFeedbackCts = new CancellationTokenSource();
+        CancellationToken token = _copiedFeedbackCts.Token;
+
+        CopyButtonText = "Copied!";
+        _ = ResetCopyFeedbackAsync(token);
+    }
+
+    private async Task ResetCopyFeedbackAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(1200, token);
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    CopyButtonText = "Copy";
+                }
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // A newer copy superseded this feedback.
         }
     }
 
@@ -843,7 +1382,7 @@ public sealed class AccountRow : INotifyPropertyChanged
             RawCode = "";
             Code = new string('-', Totp.MinDigits);
             RemainingSeconds = 0;
-            CountdownText = "(unsupported digits)";
+            CountdownText = "unsupported";
             return;
         }
 
@@ -855,28 +1394,29 @@ public sealed class AccountRow : INotifyPropertyChanged
             RawCode = code;
             Code = Group(code);
             RemainingSeconds = secondsRemaining;
-            CountdownText = $"({secondsRemaining}s left)";
+            CountdownText = $"{secondsRemaining}s";
         }
         catch
         {
             RawCode = "";
             Code = new string('-', Totp.MinDigits);
             RemainingSeconds = 0;
-            CountdownText = "(invalid secret)";
+            CountdownText = "invalid";
         }
     }
 
-    /// <summary>Groups a code into two halves for display, e.g. "492810" -> "492 810".</summary>
     private static string Group(string code)
     {
         if (code.Length == 6)
         {
             return $"{code[..3]} {code[3..]}";
         }
+
         if (code.Length == 8)
         {
             return $"{code[..4]} {code[4..]}";
         }
+
         return code;
     }
 
